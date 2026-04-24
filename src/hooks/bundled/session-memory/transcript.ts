@@ -71,7 +71,7 @@ export function sanitizeModelOutput(rawText: string): string {
   // Also strip markdown-style ## reasoning/think/thought sections that some
   // models emit (standalone header + continuation lines).
   text = text.replace(
-    /##\s*(reasoning|thought|thinking|reflection)\s*\n[\s\S]*?(?=^##\s|^\*\*|\n\d+\.|\Z)/gim,
+    /##\s*(reasoning|thought|thinking|reflection)\s*\n[\s\S]*?(?=^##\s|^\*\*|\n\d+\.|$)/gim,
     "",
   );
 
@@ -114,7 +114,7 @@ export function sanitizeModelOutput(rawText: string): string {
     "",
   );
   // Bold **System** style.
-  text = text.replace(/^\*\*System\s*[^\n]*\*\*[\s\S]*?(?=^\*\*|\Z)/gim, "");
+  text = text.replace(/^\*\*System\s*[^\n]*\*\*[\s\S]*?(?=^\*\*|$)/gim, "");
 
   // ── 8. Collapse whitespace ────────────────────────────────────────────────
   text = text.replace(/[ \t]+\n/g, "\n");
