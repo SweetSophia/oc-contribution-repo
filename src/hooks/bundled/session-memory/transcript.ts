@@ -2,6 +2,130 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { hasInterSessionUserProvenance } from "../../../sessions/input-provenance.js";
 
+/**
+ * Strip chat-template tokens, housekeeping conventions, and other model-output
+ * artifacts that must not be persisted to session memory files.
+ *
+ * Artifacts removed:
+ * - Chat-template control tokens: <|im_start|>, <|im_end|>, </s>, <|eot_id|>,
+ *   <|end_of_text|>, and similar
+ * - Housekeeping tokens: NO_REPLY, NO_REPLY_TOKENS, and variants
+ * - Metadata markers: [AUDIO_AS_VOICE], [MEDIA:...], reply_to_current / reply_to:...
+ * - Thinking/reasoning blocks: <reasoning>, </reasoning>, <think>, </think> and variants
+ * - Tool-call XML blocks: <tool_call>...</tool_call>, <tool-result>...</tool-result>
+ * - RAG markers: <<[Document...]>>, <retrieved_context>, <!--.doc--> etc.
+ * - Orphaned role markers: user:, assistant:, system: at line start
+ * - System instruction leakage: lines starting with ## System, ## Instructions, etc.
+ */
+export function sanitizeModelOutput(rawText: string): string {
+  if (!rawText || typeof rawText !== "string") {
+    return "";
+  }
+
+  let text = rawText;
+
+  // ── 1. Chat-template control tokens ────────────────────────────────────────
+  // These appear in quantized / chat-tuned model output that has not been
+  // post-processed by the model's inference stack.
+  const templateTokens = [
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|im_sep|>",
+    "<|end_of_turn|>",
+    "<|eot_id|>",
+    "<|end_of_text|>",
+    "<|reserved_", // <|reserved_xxx|> — prefix match below
+    "[REMOVED_SPECIAL_TOKEN]",
+    "</s>",
+    "<s>",
+    "<TOOL_CALL>",
+    "</TOOL_CALL>",
+    "<|message|>",
+    "<|batch|>",
+  ];
+  for (const token of templateTokens) {
+    if (token === "<|reserved_") {
+      // Prefix match for <|reserved_xxx|>
+      text = text.replace(/<\|reserved_[^|>]*\|>/gi, "");
+    } else {
+      text = text.split(token).join("");
+    }
+  }
+
+  // ── 2. NO_REPLY and housekeeping tokens ───────────────────────────────────
+  // Remove all variants regardless of case or word boundaries. This is safe
+  // because NO_REPLY is an in-band control token that should never appear in
+  // legitimate assistant output.
+  text = text.replace(/NO_REPLY/gi, "");
+  text = text.replace(/NO_REPLY_TOKENS/gi, "");
+  text = text.replace(/\[NO_REPLY[_\s]*(TOKEN|COUNT)?[^\]]*\]/gi, "");
+  text = text.replace(/\[AUDIO_AS_VOICE\]/gi, "");
+  text = text.replace(/\[MEDIA:[^\]]*\]/g, "");
+  text = text.replace(/\[reply_to[_:]?(current|[\w-]+)\]/gi, "");
+
+  // ── 3. Thinking / reasoning blocks ─────────────────────────────────────────
+  // Replace with "" (empty string) rather than " " so that runs of newlines
+  // collapse naturally in step 8. Do NOT replace with a space.
+  text = text.replace(/<(reasoning|think|thought|reflection)[^>]*>[\s\S]*?<\/\1>/gi, "");
+  text = text.replace(/<(reasoning|think|thought|reflection)[^>]*\/>/gi, "");
+  // Also strip markdown-style ## reasoning/think/thought sections that some
+  // models emit (standalone header + continuation lines).
+  text = text.replace(
+    /##\s*(reasoning|thought|thinking|reflection)\s*\n[\s\S]*?(?=^##\s|^\*\*|\n\d+\.|\Z)/gim,
+    "",
+  );
+
+  // ── 4. Tool-call XML blocks ────────────────────────────────────────────────
+  text = text.replace(/<tool_call\s+name=[^>]*>[\s\S]*?<\/tool_call>/gi, "");
+  text = text.replace(/<tool-call\s+name=[^>]*>[\s\S]*?<\/tool-call>/gi, "");
+  text = text.replace(/<tool-result\s+id=[^>]*>[\s\S]*?<\/tool-result>/gi, "");
+  text = text.replace(/<tool_call\s*\/>/gi, "");
+  text = text.replace(/<tool-call\s*\/>/gi, "");
+  text = text.replace(/<\/tool_call>/gi, "");
+  text = text.replace(/<\/tool-call>/gi, "");
+
+  // ── 5. RAG / retrieved-context markers ─────────────────────────────────────
+  text = text.replace(/<<\[Document[^\]]*\]>>/g, "");
+  text = text.replace(/<retrieved_context[\s\S]*?<\/retrieved_context>/gi, "");
+  text = text.replace(/<!--\.doc[^>]*-->/gi, "");
+  text = text.replace(/\[DOCUMENT[\s\S]*?\]/gi, "");
+
+  // ── 6. Orphaned role markers at line start ────────────────────────────────
+  // Model sometimes drops role Begin/End markers but leaves a stray prefix.
+  // Handles both `role:` (with colon) and `role\n` (role followed by newline,
+  // which happens when <|im_start|>role gets split and role is left orphaned).
+  text = text.replace(/^\s*(user|assistant|system|tool)\s*:[\s\S]*?$/gim, "");
+  text = text.replace(/^\s*(user|assistant|system|tool)\s*$/gim, "");
+
+  // ── 7. System instruction leakage ──────────────────────────────────────────
+  // Strips ## System/Instructions/... blocks. Two structural patterns:
+  //   (a) indented continuation lines (header + indented content + trailing blank)
+  //   (b) non-indented content (header + all following lines until blank or end)
+  // Use [ \t]+ (not \s+) after ## to avoid consuming the newline as whitespace.
+  // The lookahead (?=\n\n|$) consumes the trailing blank line after the block.
+  // Indented content pattern.
+  text = text.replace(
+    /^##[ \t]+(system|instructions?|directives?|protocol)[ \t]*\n(?:[ \t]+[^\n]*\n)*/gim,
+    "",
+  );
+  // Non-indented content pattern.
+  text = text.replace(
+    /^##[ \t]+(system|instructions?|directives?|protocol)[ \t]*\n[\s\S]*?(?=\n\n|$)/gim,
+    "",
+  );
+  // Bold **System** style.
+  text = text.replace(/^\*\*System\s*[^\n]*\*\*[\s\S]*?(?=^\*\*|\Z)/gim, "");
+
+  // ── 8. Collapse whitespace ────────────────────────────────────────────────
+  text = text.replace(/[ \t]+\n/g, "\n");
+  text = text.replace(/\n{3,}/g, "\n\n");
+  // Collapse consecutive spaces left by token removal (e.g. "Hello  world").
+  text = text.replace(/  +/g, " ");
+  text = text.trim();
+
+  return text;
+}
+
 function extractTextMessageContent(content: unknown): string | undefined {
   if (typeof content === "string") {
     return content;
@@ -19,85 +143,6 @@ function extractTextMessageContent(content: unknown): string | undefined {
     }
   }
   return undefined;
-}
-
-/**
- * Sanitize raw model output to strip chat-template artifacts, housekeeping tokens,
- * and other content that should not be saved to memory files.
- *
- * This prevents the progressive degradation loop described in GitHub issue #71031:
- * raw model output (template tokens, NO_REPLY markers, tool-call XML) saved to
- * memory files gets re-injected on /new, causing the model to interpret embedded
- * role markers as in-progress scaffolding and produce more malformed output.
- *
- * @param text Raw text content from model output
- * @returns Sanitized text safe for memory file storage
- */
-export function sanitizeModelOutput(text: string): string {
-  if (!text) {
-    return text;
-  }
-
-  let sanitized = text;
-
-  // Strip NO_REPLY token (OpenClaw housekeeping convention)
-  sanitized = sanitized.replace(/\[NO_REPLY\]/gi, "");
-
-  // Strip metadata delivery tags that leak channel metadata into memory
-  sanitized = sanitized.replace(/\[AUDIO_AS_VOICE\]/gi, "");
-  sanitized = sanitized.replace(/\[reply_to(?:_current|:[^\]]+)?\]/gi, "");
-
-  // Strip double-bracket reply tag variants
-  sanitized = sanitized.replace(/\[{2}reply_to(?:_current|:[^\]]+)?\]{2}/gi, "");
-  sanitized = sanitized.replace(/\[{2}audio_as_voice\]{2}/gi, "");
-
-  // Remove any empty bracket pairs left behind by token stripping
-  sanitized = sanitized.replace(/\[\s*\]/g, "");
-
-  // Strip generic chat-template control tokens (various model families)
-  sanitized = sanitized.replace(/\[REMOVED[_\s]SPECIAL[_\s]TOKEN\]/gi, "");
-  sanitized = sanitized.replace(/\[UNUSED[_\s]TOKEN\]/gi, "");
-  sanitized = sanitized.replace(/\[PAD[_\s]TOKEN\]/gi, "");
-  sanitized = sanitized.replace(/\[CLS[_\s]TOKEN\]/gi, "");
-  sanitized = sanitized.replace(/\[SEP[_\s]TOKEN\]/gi, "");
-  sanitized = sanitized.replace(/\[MASK[_\s]TOKEN\]/gi, "");
-  sanitized = sanitized.replace(/\[EXTRA[_\s]TOKEN[_\s]\d+\]/gi, "");
-  sanitized = sanitized.replace(/\[SYSTEM[_\s]PROMPT[_\s]\d+\]/gi, "");
-
-  // Strip Anthropic-style template tokens (if model outputs them raw)
-  sanitized = sanitized.replace(/<\|im_start\|>/gi, "");
-  sanitized = sanitized.replace(/<\|im_end\|>/gi, "");
-  sanitized = sanitized.replace(/<\|provider\|>/gi, "");
-  sanitized = sanitized.replace(/<\|reserved_[^|]+\|>/gi, "");
-
-  // Strip Anthropic-style special content blocks if they leak into message content
-  sanitized = sanitized.replace(/<\|message\|>[\s\S]*?<\|message_end\|>/gi, "");
-
-  // Strip tool-call XML blocks that may leak from function-calling models
-  sanitized = sanitized.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
-  sanitized = sanitized.replace(/<invoke\s+name="[^"]*">[\s\S]*?<\/invoke>/gi, "");
-  sanitized = sanitized.replace(/<tool_>[\s\S]*?<\/tool_>/gi, "");
-
-  // Strip thinking blocks (some models output raw think tags)
-  sanitized = sanitized.replace(/<think>[\s\S]*?<\/think>/gi, "");
-  sanitized = sanitized.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "");
-
-  // Strip content within obvious RAG/retrieval markers that leak system context
-  // Matches: <<[Document id=1 content="some facts"]>> with optional trailing whitespace
-  sanitized = sanitized.replace(/<<\[Document[^\]]*\]\s*>>\s*/gi, "");
-  sanitized = sanitized.replace(/<retrieved_context>[\s\S]*?<\/retrieved_context>/gi, "");
-
-  // Normalize multiple consecutive blank lines (artifact from stripping)
-  sanitized = sanitized.replace(/\n{3,}/g, "\n\n");
-
-  // Strip leading/trailing whitespace from each line, then trim overall
-  sanitized = sanitized
-    .split("\n")
-    .map((line) => line.trim())
-    .join("\n")
-    .trim();
-
-  return sanitized;
 }
 
 export async function getRecentSessionContent(
@@ -127,9 +172,9 @@ export async function getRecentSessionContent(
             if (!rawText || rawText.startsWith("/")) {
               continue;
             }
-            // Sanitize model output before saving to memory to prevent the degradation
-            // loop described in GitHub issue #71031.
-            const text = sanitizeModelOutput(rawText);
+            // Sanitize assistant output to strip template tokens, housekeeping
+            // markers, thinking blocks, and tool-call XML before saving to memory.
+            const text = role === "assistant" ? sanitizeModelOutput(rawText) : rawText;
             if (text) {
               allMessages.push(`${role}: ${text}`);
             }
