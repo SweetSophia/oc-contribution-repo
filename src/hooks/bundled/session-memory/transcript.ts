@@ -21,6 +21,85 @@ function extractTextMessageContent(content: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Sanitize raw model output to strip chat-template artifacts, housekeeping tokens,
+ * and other content that should not be saved to memory files.
+ *
+ * This prevents the progressive degradation loop described in GitHub issue #71031:
+ * raw model output (template tokens, NO_REPLY markers, tool-call XML) saved to
+ * memory files gets re-injected on /new, causing the model to interpret embedded
+ * role markers as in-progress scaffolding and produce more malformed output.
+ *
+ * @param text Raw text content from model output
+ * @returns Sanitized text safe for memory file storage
+ */
+export function sanitizeModelOutput(text: string): string {
+  if (!text) {
+    return text;
+  }
+
+  let sanitized = text;
+
+  // Strip NO_REPLY token (OpenClaw housekeeping convention)
+  sanitized = sanitized.replace(/\[NO_REPLY\]/gi, "");
+
+  // Strip metadata delivery tags that leak channel metadata into memory
+  sanitized = sanitized.replace(/\[AUDIO_AS_VOICE\]/gi, "");
+  sanitized = sanitized.replace(/\[reply_to(?:_current|:[^\]]+)?\]/gi, "");
+
+  // Strip double-bracket reply tag variants
+  sanitized = sanitized.replace(/\[{2}reply_to(?:_current|:[^\]]+)?\]{2}/gi, "");
+  sanitized = sanitized.replace(/\[{2}audio_as_voice\]{2}/gi, "");
+
+  // Remove any empty bracket pairs left behind by token stripping
+  sanitized = sanitized.replace(/\[\s*\]/g, "");
+
+  // Strip generic chat-template control tokens (various model families)
+  sanitized = sanitized.replace(/\[REMOVED[_\s]SPECIAL[_\s]TOKEN\]/gi, "");
+  sanitized = sanitized.replace(/\[UNUSED[_\s]TOKEN\]/gi, "");
+  sanitized = sanitized.replace(/\[PAD[_\s]TOKEN\]/gi, "");
+  sanitized = sanitized.replace(/\[CLS[_\s]TOKEN\]/gi, "");
+  sanitized = sanitized.replace(/\[SEP[_\s]TOKEN\]/gi, "");
+  sanitized = sanitized.replace(/\[MASK[_\s]TOKEN\]/gi, "");
+  sanitized = sanitized.replace(/\[EXTRA[_\s]TOKEN[_\s]\d+\]/gi, "");
+  sanitized = sanitized.replace(/\[SYSTEM[_\s]PROMPT[_\s]\d+\]/gi, "");
+
+  // Strip Anthropic-style template tokens (if model outputs them raw)
+  sanitized = sanitized.replace(/<\|im_start\|>/gi, "");
+  sanitized = sanitized.replace(/<\|im_end\|>/gi, "");
+  sanitized = sanitized.replace(/<\|provider\|>/gi, "");
+  sanitized = sanitized.replace(/<\|reserved_[^|]+\|>/gi, "");
+
+  // Strip Anthropic-style special content blocks if they leak into message content
+  sanitized = sanitized.replace(/<\|message\|>[\s\S]*?<\|message_end\|>/gi, "");
+
+  // Strip tool-call XML blocks that may leak from function-calling models
+  sanitized = sanitized.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
+  sanitized = sanitized.replace(/<invoke\s+name="[^"]*">[\s\S]*?<\/invoke>/gi, "");
+  sanitized = sanitized.replace(/<tool_>[\s\S]*?<\/tool_>/gi, "");
+
+  // Strip thinking blocks (some models output raw think tags)
+  sanitized = sanitized.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  sanitized = sanitized.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, "");
+
+  // Strip content within obvious RAG/retrieval markers that leak system context
+  // Matches: <<[Document id=1 content="some facts"]>> with optional trailing whitespace
+  sanitized = sanitized.replace(/<<\[Document[^\]]*\]\s*>>\s*/gi, "");
+  sanitized = sanitized.replace(/<retrieved_context>[\s\S]*?<\/retrieved_context>/gi, "");
+
+  // Normalize multiple consecutive blank lines (artifact from stripping)
+  sanitized = sanitized.replace(/\n{3,}/g, "\n\n");
+
+  // Strip leading/trailing whitespace from each line, then trim overall
+  sanitized = sanitized
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .trim();
+
+  return sanitized;
+}
+
 export async function getRecentSessionContent(
   sessionFilePath: string,
   messageCount: number = 15,
@@ -44,8 +123,14 @@ export async function getRecentSessionContent(
             if (role === "user" && hasInterSessionUserProvenance(msg)) {
               continue;
             }
-            const text = extractTextMessageContent(msg.content);
-            if (text && !text.startsWith("/")) {
+            const rawText = extractTextMessageContent(msg.content);
+            if (!rawText || rawText.startsWith("/")) {
+              continue;
+            }
+            // Sanitize model output before saving to memory to prevent the degradation
+            // loop described in GitHub issue #71031.
+            const text = sanitizeModelOutput(rawText);
+            if (text) {
               allMessages.push(`${role}: ${text}`);
             }
           }
