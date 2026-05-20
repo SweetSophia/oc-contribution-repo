@@ -1,7 +1,13 @@
 import { resolveProviderRequestCapabilities } from "./provider-attribution.js";
+import {
+  splitSystemPromptCacheBoundary,
+  stripSystemPromptCacheBoundary,
+} from "./system-prompt-cache-boundary.js";
 
+/** @deprecated Anthropic-family provider payload helper; do not use from third-party plugins. */
 export type AnthropicServiceTier = "auto" | "standard_only";
 
+/** @deprecated Anthropic-family provider payload helper; do not use from third-party plugins. */
 export type AnthropicEphemeralCacheControl = {
   type: "ephemeral";
   ttl?: "1h";
@@ -16,11 +22,35 @@ type AnthropicPayloadPolicyInput = {
   serviceTier?: AnthropicServiceTier;
 };
 
+/** @deprecated Anthropic-family provider payload helper; do not use from third-party plugins. */
 export type AnthropicPayloadPolicy = {
   allowsServiceTier: boolean;
   cacheControl: AnthropicEphemeralCacheControl | undefined;
   serviceTier: AnthropicServiceTier | undefined;
 };
+
+function resolveBaseUrlHostname(baseUrl: string): string | undefined {
+  try {
+    return new URL(baseUrl).hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+function isLongTtlEligibleEndpoint(baseUrl: string | undefined): boolean {
+  if (typeof baseUrl !== "string") {
+    return false;
+  }
+  const hostname = resolveBaseUrlHostname(baseUrl);
+  if (!hostname) {
+    return false;
+  }
+  return (
+    hostname === "api.anthropic.com" ||
+    hostname === "aiplatform.googleapis.com" ||
+    hostname.endsWith("-aiplatform.googleapis.com")
+  );
+}
 
 function resolveAnthropicEphemeralCacheControl(
   baseUrl: string | undefined,
@@ -31,8 +61,10 @@ function resolveAnthropicEphemeralCacheControl(
   if (retention === "none") {
     return undefined;
   }
+  // Trust explicit long-retention opt-ins for Anthropic-compatible custom providers.
+  // Keep hostname gating for implicit/env-driven long retention so defaults stay conservative.
   const ttl =
-    retention === "long" && typeof baseUrl === "string" && baseUrl.includes("api.anthropic.com")
+    retention === "long" && (cacheRetention === "long" || isLongTtlEligibleEndpoint(baseUrl))
       ? "1h"
       : undefined;
   return { type: "ephemeral", ...(ttl ? { ttl } : {}) };
@@ -46,13 +78,57 @@ function applyAnthropicCacheControlToSystem(
     return;
   }
 
+  const normalizedBlocks: Array<unknown> = [];
+  for (const block of system) {
+    if (!block || typeof block !== "object") {
+      normalizedBlocks.push(block);
+      continue;
+    }
+    const record = block as Record<string, unknown>;
+    if (record.type !== "text" || typeof record.text !== "string") {
+      normalizedBlocks.push(block);
+      continue;
+    }
+    const split = splitSystemPromptCacheBoundary(record.text);
+    if (!split) {
+      if (record.cache_control === undefined) {
+        record.cache_control = cacheControl;
+      }
+      normalizedBlocks.push(record);
+      continue;
+    }
+
+    const { cache_control: existingCacheControl, ...rest } = record;
+    if (split.stablePrefix) {
+      normalizedBlocks.push({
+        ...rest,
+        text: split.stablePrefix,
+        cache_control: existingCacheControl ?? cacheControl,
+      });
+    }
+    if (split.dynamicSuffix) {
+      normalizedBlocks.push({
+        ...rest,
+        text: split.dynamicSuffix,
+      });
+    }
+  }
+
+  system.splice(0, system.length, ...normalizedBlocks);
+}
+
+function stripAnthropicSystemPromptBoundary(system: unknown): void {
+  if (!Array.isArray(system)) {
+    return;
+  }
+
   for (const block of system) {
     if (!block || typeof block !== "object") {
       continue;
     }
     const record = block as Record<string, unknown>;
-    if (record.type === "text" && record.cache_control === undefined) {
-      record.cache_control = cacheControl;
+    if (record.type === "text" && typeof record.text === "string") {
+      record.text = stripSystemPromptCacheBoundary(record.text);
     }
   }
 }
@@ -103,6 +179,7 @@ function applyAnthropicCacheControlToMessages(
   }
 }
 
+/** @deprecated Anthropic-family provider payload helper; do not use from third-party plugins. */
 export function resolveAnthropicPayloadPolicy(
   input: AnthropicPayloadPolicyInput,
 ): AnthropicPayloadPolicy {
@@ -124,6 +201,7 @@ export function resolveAnthropicPayloadPolicy(
   };
 }
 
+/** @deprecated Anthropic-family provider payload helper; do not use from third-party plugins. */
 export function applyAnthropicPayloadPolicyToParams(
   payloadObj: Record<string, unknown>,
   policy: AnthropicPayloadPolicy,
@@ -136,15 +214,21 @@ export function applyAnthropicPayloadPolicyToParams(
     payloadObj.service_tier = policy.serviceTier;
   }
 
+  if (policy.cacheControl) {
+    applyAnthropicCacheControlToSystem(payloadObj.system, policy.cacheControl);
+  } else {
+    stripAnthropicSystemPromptBoundary(payloadObj.system);
+  }
+
   if (!policy.cacheControl) {
     return;
   }
 
-  applyAnthropicCacheControlToSystem(payloadObj.system, policy.cacheControl);
   // Preserve Anthropic cache-write scope by only tagging the trailing user turn.
   applyAnthropicCacheControlToMessages(payloadObj.messages, policy.cacheControl);
 }
 
+/** @deprecated Anthropic-family provider payload helper; do not use from third-party plugins. */
 export function applyAnthropicEphemeralCacheControlMarkers(
   payloadObj: Record<string, unknown>,
 ): void {

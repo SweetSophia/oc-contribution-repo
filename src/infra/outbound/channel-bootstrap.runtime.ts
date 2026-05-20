@@ -1,10 +1,11 @@
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
-import type { OpenClawConfig } from "../../config/config.js";
 import { applyPluginAutoEnable } from "../../config/plugin-auto-enable.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { resolveRuntimePluginRegistry } from "../../plugins/loader.js";
+import type { PluginChannelRegistration } from "../../plugins/registry-types.js";
 import {
+  getActivePluginChannelRegistry,
   getActivePluginChannelRegistryVersion,
-  getActivePluginRegistry,
 } from "../../plugins/runtime.js";
 import type { DeliverableMessageChannel } from "../../utils/message-channel.js";
 
@@ -12,6 +13,10 @@ const bootstrapAttempts = new Set<string>();
 
 export function resetOutboundChannelBootstrapStateForTests(): void {
   bootstrapAttempts.clear();
+}
+
+function channelEntryCanSend(entry: PluginChannelRegistration | undefined): boolean {
+  return Boolean(entry?.plugin?.outbound?.sendText ?? entry?.plugin?.message?.send?.text);
 }
 
 export function bootstrapOutboundChannelPlugin(params: {
@@ -23,11 +28,11 @@ export function bootstrapOutboundChannelPlugin(params: {
     return;
   }
 
-  const activeRegistry = getActivePluginRegistry();
-  const activeHasRequestedChannel = activeRegistry?.channels?.some(
+  const activeChannelRegistry = getActivePluginChannelRegistry();
+  const activeChannelEntry = activeChannelRegistry?.channels?.find(
     (entry) => entry?.plugin?.id === params.channel,
   );
-  if (activeHasRequestedChannel) {
+  if (channelEntryCanSend(activeChannelEntry)) {
     return;
   }
 

@@ -9,13 +9,11 @@ import {
   PROVIDER_ID,
   applyFoundryProfileBinding,
   applyFoundryProviderConfig,
-  buildFoundryModelCompat,
   buildFoundryProviderBaseUrl,
   extractFoundryEndpoint,
   isFoundryProviderApi,
   normalizeFoundryEndpoint,
-  resolveConfiguredModelNameHint,
-  resolveFoundryApi,
+  resolveFoundryModelCapabilities,
   resolveFoundryTargetProfileId,
 } from "./shared.js";
 
@@ -32,12 +30,15 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         return;
       }
       const selectedModelId = ctx.model.slice(`${PROVIDER_ID}/`.length);
-      const existingModel = providerConfig.models.find(
+      const configuredModels = providerConfig.models ?? [];
+      const existingModel = configuredModels.find(
         (model: { id: string }) => model.id === selectedModelId,
       );
-      const selectedModelNameHint = resolveConfiguredModelNameHint(
+      const selectedModelCapabilities = resolveFoundryModelCapabilities(
         selectedModelId,
         existingModel?.name,
+        isFoundryProviderApi(existingModel?.api) ? existingModel.api : providerConfig.api,
+        existingModel?.input,
       );
       const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
       // Prefer the persisted per-model API choice from onboarding/discovery so arbitrary
@@ -45,31 +46,31 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
       const selectedModelApi = isFoundryProviderApi(existingModel?.api)
         ? existingModel.api
         : providerConfig.api;
-      const selectedModelCompat = buildFoundryModelCompat(
-        selectedModelId,
-        selectedModelNameHint,
-        selectedModelApi,
-      );
-      const nextModels = providerConfig.models.map((model) =>
-        model.id === selectedModelId
-          ? {
-              ...model,
-              api: resolveFoundryApi(selectedModelId, selectedModelNameHint, selectedModelApi),
-              ...(selectedModelCompat ? { compat: selectedModelCompat } : {}),
-            }
-          : model,
-      );
+      const nextModels = configuredModels.map((model) => {
+        if (model.id !== selectedModelId) {
+          return model;
+        }
+        const nextModel = Object.assign({}, model, {
+          name: selectedModelCapabilities.modelName,
+          api: selectedModelCapabilities.api,
+          input: selectedModelCapabilities.input,
+        });
+        if (selectedModelCapabilities.compat) {
+          nextModel.compat = selectedModelCapabilities.compat;
+        }
+        return nextModel;
+      });
       if (!nextModels.some((model) => model.id === selectedModelId)) {
         nextModels.push({
           id: selectedModelId,
-          name: selectedModelNameHint ?? selectedModelId,
-          api: resolveFoundryApi(selectedModelId, selectedModelNameHint, selectedModelApi),
+          name: selectedModelCapabilities.modelName,
+          api: selectedModelCapabilities.api,
           reasoning: false,
-          input: ["text"],
+          input: selectedModelCapabilities.input,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: 128_000,
           maxTokens: 16_384,
-          ...(selectedModelCompat ? { compat: selectedModelCompat } : {}),
+          ...(selectedModelCapabilities.compat ? { compat: selectedModelCapabilities.compat } : {}),
         });
       }
       const nextProviderConfig: ModelProviderConfig = {
@@ -77,10 +78,10 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         baseUrl: buildFoundryProviderBaseUrl(
           providerEndpoint,
           selectedModelId,
-          selectedModelNameHint,
+          selectedModelCapabilities.modelName,
           selectedModelApi,
         ),
-        api: resolveFoundryApi(selectedModelId, selectedModelNameHint, selectedModelApi),
+        api: selectedModelCapabilities.api,
         models: nextModels,
       };
       const targetProfileId = resolveFoundryTargetProfileId(ctx.config);
@@ -90,18 +91,28 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
       applyFoundryProviderConfig(ctx.config, nextProviderConfig);
     },
     normalizeResolvedModel: ({ modelId, model }: ProviderNormalizeResolvedModelContext) => {
-      const endpoint = extractFoundryEndpoint(String(model.baseUrl ?? ""));
+      const endpoint = extractFoundryEndpoint(model.baseUrl ?? "");
       if (!endpoint) {
         return model;
       }
-      const modelNameHint = resolveConfiguredModelNameHint(modelId, model.name);
-      const configuredApi = isFoundryProviderApi(model.api) ? model.api : undefined;
-      const compat = buildFoundryModelCompat(modelId, modelNameHint, configuredApi);
+      const capabilities = resolveFoundryModelCapabilities(
+        modelId,
+        model.name,
+        isFoundryProviderApi(model.api) ? model.api : undefined,
+        model.input,
+      );
       return {
         ...model,
-        api: resolveFoundryApi(modelId, modelNameHint, configuredApi),
-        baseUrl: buildFoundryProviderBaseUrl(endpoint, modelId, modelNameHint, configuredApi),
-        ...(compat ? { compat } : {}),
+        name: capabilities.modelName,
+        api: capabilities.api,
+        input: capabilities.input,
+        baseUrl: buildFoundryProviderBaseUrl(
+          endpoint,
+          modelId,
+          capabilities.modelName,
+          capabilities.api,
+        ),
+        ...(capabilities.compat ? { compat: capabilities.compat } : {}),
       };
     },
     prepareRuntimeAuth: prepareFoundryRuntimeAuth,

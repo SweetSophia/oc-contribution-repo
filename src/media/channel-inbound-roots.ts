@@ -1,53 +1,97 @@
 import type { MsgContext } from "../auto-reply/templating.js";
-import { getBundledChannelContractSurfaceEntries } from "../channels/plugins/contract-surfaces.js";
-import type { OpenClawConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.js";
+import { loadBundledPluginPublicArtifactModuleSync } from "../plugins/public-surface-loader.js";
+import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
 
-type ChannelInboundMediaRootsSurface = {
+type ChannelMediaContractApi = {
   resolveInboundAttachmentRoots?: (params: {
     cfg: OpenClawConfig;
-    accountId?: string | null;
-  }) => string[];
+    accountId?: string;
+  }) => readonly string[] | undefined;
   resolveRemoteInboundAttachmentRoots?: (params: {
     cfg: OpenClawConfig;
-    accountId?: string | null;
-  }) => string[];
+    accountId?: string;
+  }) => readonly string[] | undefined;
 };
+type ChannelMediaRootResolver = keyof ChannelMediaContractApi;
 
-function normalizeChannelId(value?: string | null): string | undefined {
-  const normalized = value?.trim().toLowerCase();
-  return normalized || undefined;
+const mediaContractApiByChannel = new Map<string, ChannelMediaContractApi | null>();
+
+function loadChannelMediaContractApi(
+  channelId: string,
+  resolver: ChannelMediaRootResolver,
+): ChannelMediaContractApi | undefined {
+  if (mediaContractApiByChannel.has(channelId)) {
+    const cached = mediaContractApiByChannel.get(channelId);
+    return cached && typeof cached[resolver] === "function" ? cached : undefined;
+  }
+
+  try {
+    const loaded = loadBundledPluginPublicArtifactModuleSync<ChannelMediaContractApi>({
+      dirName: channelId,
+      artifactBasename: "media-contract-api.js",
+    });
+    mediaContractApiByChannel.set(channelId, loaded);
+    if (typeof loaded[resolver] === "function") {
+      return loaded;
+    }
+    return undefined;
+  } catch (error) {
+    if (
+      !(
+        error instanceof Error &&
+        error.message.startsWith("Unable to resolve bundled plugin public surface ")
+      )
+    ) {
+      throw error;
+    }
+  }
+
+  mediaContractApiByChannel.set(channelId, null);
+  return undefined;
 }
 
-function findChannelMediaSurface(
-  channelId?: string | null,
-): ChannelInboundMediaRootsSurface | undefined {
-  const normalized = normalizeChannelId(channelId);
+function findChannelMediaContractApi(
+  channelId: string | null | undefined,
+  resolver: ChannelMediaRootResolver,
+) {
+  const normalized = normalizeOptionalLowercaseString(channelId);
   if (!normalized) {
     return undefined;
   }
-  return getBundledChannelContractSurfaceEntries().find(
-    (entry) => normalizeChannelId(entry.pluginId) === normalized,
-  )?.surface as ChannelInboundMediaRootsSurface | undefined;
+  return loadChannelMediaContractApi(normalized, resolver);
 }
 
 export function resolveChannelInboundAttachmentRoots(params: {
   cfg: OpenClawConfig;
   ctx: MsgContext;
 }): readonly string[] | undefined {
-  const surface = findChannelMediaSurface(params.ctx.Surface ?? params.ctx.Provider);
-  return surface?.resolveInboundAttachmentRoots?.({
-    cfg: params.cfg,
-    accountId: params.ctx.AccountId,
-  });
+  const contractApi = findChannelMediaContractApi(
+    params.ctx.Surface ?? params.ctx.Provider,
+    "resolveInboundAttachmentRoots",
+  );
+  if (contractApi?.resolveInboundAttachmentRoots) {
+    return contractApi.resolveInboundAttachmentRoots({
+      cfg: params.cfg,
+      accountId: params.ctx.AccountId,
+    });
+  }
+  return undefined;
 }
 
 export function resolveChannelRemoteInboundAttachmentRoots(params: {
   cfg: OpenClawConfig;
   ctx: MsgContext;
 }): readonly string[] | undefined {
-  const surface = findChannelMediaSurface(params.ctx.Surface ?? params.ctx.Provider);
-  return surface?.resolveRemoteInboundAttachmentRoots?.({
-    cfg: params.cfg,
-    accountId: params.ctx.AccountId,
-  });
+  const contractApi = findChannelMediaContractApi(
+    params.ctx.Surface ?? params.ctx.Provider,
+    "resolveRemoteInboundAttachmentRoots",
+  );
+  if (contractApi?.resolveRemoteInboundAttachmentRoots) {
+    return contractApi.resolveRemoteInboundAttachmentRoots({
+      cfg: params.cfg,
+      accountId: params.ctx.AccountId,
+    });
+  }
+  return undefined;
 }

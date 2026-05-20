@@ -2,8 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import "./test-helpers/fast-coding-tools.js";
+import "./test-helpers/fast-openclaw-tools.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { createOpenClawCodingTools } from "./pi-tools.js";
+import { createCanonicalFixtureSkill } from "./skills.test-helpers.js";
 import { createHostSandboxFsBridge } from "./test-helpers/host-sandbox-fs-bridge.js";
 import { expectReadWriteEditTools, getTextContent } from "./test-helpers/pi-tools-fs-helpers.js";
 import { createPiToolsSandboxContext } from "./test-helpers/pi-tools-sandbox-context.js";
@@ -28,7 +31,9 @@ function createExecTool(workspaceDir: string) {
     exec: { host: "gateway", ask: "off", security: "full" },
   });
   const execTool = tools.find((tool) => tool.name === "exec");
-  expect(execTool).toBeDefined();
+  if (!execTool) {
+    throw new Error("expected exec tool");
+  }
   return execTool;
 }
 
@@ -43,9 +48,11 @@ async function expectExecCwdResolvesTo(
     result?.details && typeof result.details === "object" && "cwd" in result.details
       ? (result.details as { cwd?: string }).cwd
       : undefined;
-  expect(cwd).toBeTruthy();
+  if (typeof cwd !== "string" || cwd.length === 0) {
+    throw new Error("expected exec result cwd");
+  }
   const [resolvedOutput, resolvedExpected] = await Promise.all([
-    fs.realpath(String(cwd)),
+    fs.realpath(cwd),
     fs.realpath(expectedDir),
   ]);
   expect(resolvedOutput).toBe(resolvedExpected);
@@ -78,8 +85,7 @@ describe("workspace path resolution", () => {
           await fs.writeFile(path.join(workspaceDir, editFile), "hello world", "utf8");
           await editTool.execute("ws-edit", {
             path: editFile,
-            oldText: "world",
-            newText: "openclaw",
+            edits: [{ oldText: "world", newText: "openclaw" }],
           });
           expect(await fs.readFile(path.join(workspaceDir, editFile), "utf8")).toBe(
             "hello openclaw",
@@ -104,8 +110,7 @@ describe("workspace path resolution", () => {
 
           await editTool.execute("ws-edit-delete", {
             path: testFile,
-            oldText: " world",
-            newText: "",
+            edits: [{ oldText: " world", newText: "" }],
           });
 
           expect(await fs.readFile(path.join(workspaceDir, testFile), "utf8")).toBe("hello");
@@ -218,6 +223,110 @@ describe("workspace path resolution", () => {
       }
     });
   });
+
+  it("allows workspaceOnly reads for resolved skill roots without allowing other filesystem access", async () => {
+    await withTempDir("openclaw-skill-read-", async (rootDir) => {
+      const workspaceDir = path.join(rootDir, "workspace");
+      const skillDir = path.join(rootDir, "global-skills", "demo");
+      const siblingDir = path.join(rootDir, "global-skills", "other");
+      await fs.mkdir(workspaceDir, { recursive: true });
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.mkdir(siblingDir, { recursive: true });
+      const skillFile = path.join(skillDir, "SKILL.md");
+      const guideFile = path.join(skillDir, "guide.md");
+      const siblingFile = path.join(siblingDir, "SKILL.md");
+      const outsideFile = path.join(rootDir, "outside.txt");
+      await fs.writeFile(skillFile, "# Demo skill\noriginal skill\n", "utf8");
+      await fs.writeFile(guideFile, "skill guide", "utf8");
+      await fs.writeFile(siblingFile, "sibling skill", "utf8");
+      await fs.writeFile(outsideFile, "outside secret", "utf8");
+
+      const cfg: OpenClawConfig = { tools: { fs: { workspaceOnly: true } } };
+      const tools = createOpenClawCodingTools({
+        workspaceDir,
+        config: cfg,
+        skillsSnapshot: {
+          prompt: "",
+          skills: [{ name: "demo" }],
+          resolvedSkills: [
+            createCanonicalFixtureSkill({
+              name: "demo",
+              description: "Demo skill",
+              filePath: skillFile,
+              baseDir: skillDir,
+              source: "test",
+            }),
+          ],
+        },
+      });
+      const { readTool, writeTool, editTool } = expectReadWriteEditTools(tools);
+
+      expect(getTextContent(await readTool.execute("read-skill", { path: skillFile }))).toContain(
+        "original skill",
+      );
+      expect(
+        getTextContent(await readTool.execute("read-skill-guide", { path: guideFile })),
+      ).toContain("skill guide");
+      await expect(readTool.execute("read-sibling", { path: siblingFile })).rejects.toThrow(
+        /Path escapes sandbox root/i,
+      );
+      await expect(readTool.execute("read-outside", { path: outsideFile })).rejects.toThrow(
+        /Path escapes sandbox root/i,
+      );
+      await expect(
+        writeTool.execute("write-skill", { path: skillFile, content: "overwritten" }),
+      ).rejects.toThrow(/Path escapes sandbox root|outside-workspace/i);
+      await expect(
+        editTool.execute("edit-skill", {
+          path: skillFile,
+          edits: [{ oldText: "original", newText: "edited" }],
+        }),
+      ).rejects.toThrow(/Path escapes sandbox root|outside-workspace/i);
+      expect(await fs.readFile(skillFile, "utf8")).toContain("original skill");
+    });
+  });
+
+  it("rejects symlink escapes inside resolved skill roots", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    await withTempDir("openclaw-skill-read-symlink-", async (rootDir) => {
+      const workspaceDir = path.join(rootDir, "workspace");
+      const skillDir = path.join(rootDir, "global-skills", "demo");
+      await fs.mkdir(workspaceDir, { recursive: true });
+      await fs.mkdir(skillDir, { recursive: true });
+      const skillFile = path.join(skillDir, "SKILL.md");
+      const outsideFile = path.join(rootDir, "outside.txt");
+      const linkPath = path.join(skillDir, "outside-link.txt");
+      await fs.writeFile(skillFile, "# Demo skill\n", "utf8");
+      await fs.writeFile(outsideFile, "outside secret", "utf8");
+      await fs.symlink(outsideFile, linkPath);
+
+      const cfg: OpenClawConfig = { tools: { fs: { workspaceOnly: true } } };
+      const tools = createOpenClawCodingTools({
+        workspaceDir,
+        config: cfg,
+        skillsSnapshot: {
+          prompt: "",
+          skills: [{ name: "demo" }],
+          resolvedSkills: [
+            createCanonicalFixtureSkill({
+              name: "demo",
+              description: "Demo skill",
+              filePath: skillFile,
+              baseDir: skillDir,
+              source: "test",
+            }),
+          ],
+        },
+      });
+      const { readTool } = expectReadWriteEditTools(tools);
+
+      await expect(readTool.execute("read-skill-symlink", { path: linkPath })).rejects.toThrow(
+        /symlink|sandbox|outside|escape/i,
+      );
+    });
+  });
 });
 
 describe("sandboxed workspace paths", () => {
@@ -251,8 +360,7 @@ describe("sandboxed workspace paths", () => {
 
         await editTool?.execute("sbx-edit", {
           path: "new.txt",
-          oldText: "write",
-          newText: "edit",
+          edits: [{ oldText: "write", newText: "edit" }],
         });
         const edited = await fs.readFile(path.join(sandboxDir, "new.txt"), "utf8");
         expect(edited).toBe("sandbox edit");
